@@ -44,6 +44,7 @@ export function useUsageData(): UseUsageDataReturn {
   const managementKey = useAuthStore((state) => state.managementKey);
   const usageServiceEnabled = useUsageServiceStore((state) => state.enabled);
   const usageServiceBase = useUsageServiceStore((state) => state.serviceBase);
+  const setUsageServiceConfig = useUsageServiceStore((state) => state.setUsageServiceConfig);
   const [usage, setUsage] = useState<UsagePayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -53,6 +54,42 @@ export function useUsageData(): UseUsageDataReturn {
   const [usageServiceAvailable, setUsageServiceAvailable] = useState(false);
   const requestIdRef = useRef(0);
   const aliasRequestIdRef = useRef(0);
+  const autoSyncedModelsRef = useRef('');
+
+  const collectUsageModels = useCallback((payload: UsagePayload | null): string[] => {
+    const apis = payload?.apis;
+    if (!apis || typeof apis !== 'object') return [];
+
+    const models = new Set<string>();
+    Object.values(apis).forEach((entry) => {
+      if (!entry || typeof entry !== 'object') return;
+      const modelMap = (entry as { models?: Record<string, unknown> }).models;
+      if (!modelMap || typeof modelMap !== 'object') return;
+      Object.keys(modelMap)
+        .map((name) => String(name).trim())
+        .filter(Boolean)
+        .forEach((name) => models.add(name));
+    });
+
+    return Array.from(models).sort();
+  }, []);
+
+  const buildCompanionUsageCandidates = useCallback((): string[] => {
+    const sources = [apiBase, detectApiBaseFromLocation()]
+      .map((value) => normalizeUsageServiceBase(value || ''))
+      .filter(Boolean);
+
+    const companions = sources.flatMap((value) => {
+      try {
+        const url = new URL(value);
+        return [normalizeUsageServiceBase(`${url.protocol}//${url.hostname}:18317`)];
+      } catch {
+        return [];
+      }
+    });
+
+    return Array.from(new Set(companions.filter(Boolean)));
+  }, [apiBase]);
 
   const resolveUsageServiceBase = useCallback(async (): Promise<string> => {
     if (usageServiceEnabled && usageServiceBase) {
@@ -61,7 +98,7 @@ export function useUsageData(): UseUsageDataReturn {
 
     const candidates = Array.from(
       new Set(
-        [apiBase, detectApiBaseFromLocation()]
+        [apiBase, detectApiBaseFromLocation(), ...buildCompanionUsageCandidates()]
           .map((value) => normalizeUsageServiceBase(value || ''))
           .filter(Boolean)
       )
@@ -71,6 +108,17 @@ export function useUsageData(): UseUsageDataReturn {
       try {
         const info = await usageServiceApi.getInfo(candidate);
         if (isUsageServiceId(info.service)) {
+          if (apiBase && managementKey) {
+            try {
+              await usageServiceApi.setup(candidate, {
+                cpaBaseUrl: apiBase,
+                managementKey,
+              });
+            } catch {
+              // Ignore setup races and already-configured responses here.
+            }
+          }
+          setUsageServiceConfig({ enabled: true, serviceBase: candidate });
           return candidate;
         }
       } catch {
@@ -79,7 +127,14 @@ export function useUsageData(): UseUsageDataReturn {
     }
 
     return '';
-  }, [apiBase, usageServiceBase, usageServiceEnabled]);
+  }, [
+    apiBase,
+    buildCompanionUsageCandidates,
+    managementKey,
+    setUsageServiceConfig,
+    usageServiceBase,
+    usageServiceEnabled,
+  ]);
 
   const getModelPricesFromApi = useCallback(async (): Promise<ModelPricesResponse> => {
     const serviceBase = await resolveUsageServiceBase();
@@ -207,6 +262,28 @@ export function useUsageData(): UseUsageDataReturn {
     void loadApiKeyAliases();
     void loadUsage();
   }, [loadApiKeyAliases, loadModelPricesFromStorage, loadUsage]);
+
+  useEffect(() => {
+    const usageModels = collectUsageModels(usage);
+    if (!usageModels.length) return;
+
+    const missingModels = usageModels.filter((model) => !modelPrices[model]);
+    if (!missingModels.length) return;
+
+    const syncKey = missingModels.join('|');
+    if (autoSyncedModelsRef.current === syncKey) return;
+    autoSyncedModelsRef.current = syncKey;
+
+    void (async () => {
+      try {
+        const response = await syncModelPricesFromApi(missingModels);
+        setModelPricesState((current) => ({ ...current, ...(response.prices ?? {}) }));
+        clearModelPrices();
+      } catch {
+        // Some models simply do not exist in the upstream price catalog.
+      }
+    })();
+  }, [collectUsageModels, modelPrices, syncModelPricesFromApi, usage]);
 
   const setModelPrices = useCallback(
     async (prices: Record<string, ModelPrice>) => {

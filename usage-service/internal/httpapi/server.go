@@ -806,6 +806,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePanel(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	if s.cfg.PanelPath != "" {
 		if file, err := os.Open(s.cfg.PanelPath); err == nil {
 			defer file.Close()

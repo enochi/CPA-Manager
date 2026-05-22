@@ -141,6 +141,7 @@
     "auth_files": "Файлы аутентификации",
     "oauth": "OAuth вход",
     "quota_management": "Управление квотами",
+    "customer_key_policies": "Политики ключей клиентов",
     "monitoring_center": "Мониторинг запросов",
     "config_management": "Панель конфигурации",
     "logs": "Просмотр логов",

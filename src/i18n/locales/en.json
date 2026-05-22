@@ -143,6 +143,7 @@
     "auth_files": "Auth Files",
     "oauth": "OAuth Login",
     "quota_management": "Quota Management",
+    "customer_key_policies": "Customer Key Policies",
     "monitoring_center": "Request Monitoring",
     "config_management": "Config Panel",
     "logs": "Logs Viewer",

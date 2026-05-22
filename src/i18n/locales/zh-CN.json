@@ -143,6 +143,7 @@
     "auth_files": "认证文件",
     "oauth": "OAuth 登录",
     "quota_management": "配额管理",
+    "customer_key_policies": "客户 Key 策略",
     "monitoring_center": "请求监控",
     "config_management": "配置面板",
     "logs": "日志查看",
