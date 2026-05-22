@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/seakee/cpa-manager/usage-service/internal/collector"
 	"github.com/seakee/cpa-manager/usage-service/internal/config"
@@ -409,6 +410,37 @@ func TestManagerConfigRejectsPollIntervalAboveRetention(t *testing.T) {
 	}
 }
 
+func TestManagerConfigPreservesSubscribeCollectorMode(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v0/management/config" && r.Header.Get("Authorization") == "Bearer management-key" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"usage-statistics-enabled":true}`))
+			return
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler := newTestHandler(t, upstream.URL, true)
+	body := bytes.NewBufferString(`{"config":{"cpaConnection":{"cpaBaseUrl":"` + upstream.URL + `","managementKey":"management-key"},"collector":{"enabled":false,"collectorMode":"subscribe","queue":"usage","popSide":"right","batchSize":100,"pollIntervalMs":500,"queryLimit":50000},"externalUsageService":{"enabled":false}}}`)
+	req := httptest.NewRequest(http.MethodPut, "/usage-service/config", body)
+	req.Header.Set("Authorization", "Bearer management-key")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("save status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var response managerConfigResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Config.Collector.CollectorMode != "subscribe" {
+		t.Fatalf("collectorMode = %q, want subscribe", response.Config.Collector.CollectorMode)
+	}
+}
+
 func TestManagerConfigReadsLegacySetup(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v0/management/config" && r.Header.Get("Authorization") == "Bearer management-key" {
@@ -609,6 +641,69 @@ func TestAPIKeyAliasesSaveLoadAndDelete(t *testing.T) {
 	}
 }
 
+func TestAPIKeyAliasesActiveHashesMigration(t *testing.T) {
+	handler := newTestHandler(t, "http://example.test", true)
+	const orphanHash = "1111111111111111111111111111111111111111111111111111111111111111"
+	const newHash = "2222222222222222222222222222222222222222222222222222222222222222"
+	const activeHash = "3333333333333333333333333333333333333333333333333333333333333333"
+
+	// 预置：orphanHash 关联 team-a（模拟编辑/删除密钥后留下的孤儿映射）。
+	seed := bytes.NewBufferString(`{"items":[{"apiKeyHash":"` + orphanHash + `","alias":"team-a"},{"apiKeyHash":"` + activeHash + `","alias":"team-b"}]}`)
+	req := httptest.NewRequest(http.MethodPut, "/v0/management/api-key-aliases", seed)
+	req.Header.Set("Authorization", "Bearer management-key")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("seed status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	// 编辑/重建场景：新 hash 想复用 team-a，orphanHash 不在活跃集合，应放行并清理孤儿。
+	migrate := bytes.NewBufferString(`{"items":[{"apiKeyHash":"` + newHash + `","alias":"team-a"}],"activeApiKeyHashes":["` + newHash + `","` + activeHash + `"]}`)
+	req = httptest.NewRequest(http.MethodPut, "/v0/management/api-key-aliases", migrate)
+	req.Header.Set("Authorization", "Bearer management-key")
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("migrate status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	var response struct {
+		Items []struct {
+			APIKeyHash string `json:"apiKeyHash"`
+			Alias      string `json:"alias"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	hashByAlias := map[string]string{}
+	for _, item := range response.Items {
+		hashByAlias[item.Alias] = item.APIKeyHash
+	}
+	if hashByAlias["team-a"] != newHash {
+		t.Fatalf("team-a should belong to newHash, got %#v", response.Items)
+	}
+	if hashByAlias["team-b"] != activeHash {
+		t.Fatalf("team-b should remain on activeHash, got %#v", response.Items)
+	}
+	if len(response.Items) != 2 {
+		t.Fatalf("orphan should be removed, got %#v", response.Items)
+	}
+
+	// 真冲突：被占用方仍在活跃集合，应返回 api_key_alias_duplicate。
+	conflict := bytes.NewBufferString(`{"items":[{"apiKeyHash":"` + newHash + `","alias":"team-b"}],"activeApiKeyHashes":["` + newHash + `","` + activeHash + `"]}`)
+	req = httptest.NewRequest(http.MethodPut, "/v0/management/api-key-aliases", conflict)
+	req.Header.Set("Authorization", "Bearer management-key")
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("active conflict status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"code":"api_key_alias_duplicate"`) {
+		t.Fatalf("active conflict body = %s", rr.Body.String())
+	}
+}
+
 func TestModelPricesSyncFromLiteLLMFormat(t *testing.T) {
 	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -679,4 +774,209 @@ func TestModelPricesSyncFromLiteLLMFormat(t *testing.T) {
 
 func closeFloat(left float64, right float64) bool {
 	return math.Abs(left-right) < 0.0000001
+}
+
+func TestSelectModelPricesMatchesByPriorityAndReportsUnmatched(t *testing.T) {
+	prices := map[string]store.ModelPrice{
+		"gpt-4o-2024-08-06":                   {Prompt: 2.5, Completion: 10},
+		"anthropic/claude-3.5-sonnet":         {Prompt: 3, Completion: 15},
+		"openrouter/anthropic/claude-3.5-sonnet": {Prompt: 3.1, Completion: 15.1},
+		"gemini/gemini-2.5-flash":             {Prompt: 0.075, Completion: 0.3},
+		"claude-sonnet-4-5-20250929":          {Prompt: 3.2, Completion: 16},
+	}
+
+	models := []string{
+		"gpt-4o-2024-08-06",         // 精确
+		"GEMINI/Gemini-2.5-Flash",   // 大小写不敏感
+		"claude-3.5-sonnet",         // basename：应选最短 anthropic/* 而非 openrouter/*
+		"claude-sonnet-4-5",         // 剥离日期后缀
+		"unknown-model-xyz",         // unmatched
+	}
+
+	selected, unmatched := selectModelPrices(prices, models)
+
+	if got := selected["gpt-4o-2024-08-06"].Prompt; got != 2.5 {
+		t.Fatalf("exact match prompt = %v", got)
+	}
+	if got := selected["GEMINI/Gemini-2.5-Flash"].Prompt; got != 0.075 {
+		t.Fatalf("case-insensitive match prompt = %v", got)
+	}
+	if got := selected["claude-3.5-sonnet"].Prompt; got != 3 {
+		t.Fatalf("basename match should prefer shortest key, got prompt = %v", got)
+	}
+	if got := selected["claude-sonnet-4-5"].Prompt; got != 3.2 {
+		t.Fatalf("date-stripped match prompt = %v", got)
+	}
+	if _, ok := selected["unknown-model-xyz"]; ok {
+		t.Fatalf("unknown model should not be selected")
+	}
+	if len(unmatched) != 1 || unmatched[0] != "unknown-model-xyz" {
+		t.Fatalf("unmatched = %#v", unmatched)
+	}
+}
+
+func TestSelectModelPricesEmptyModelsReturnsAll(t *testing.T) {
+	prices := map[string]store.ModelPrice{
+		"a": {Prompt: 1},
+		"b": {Prompt: 2},
+	}
+	selected, unmatched := selectModelPrices(prices, nil)
+	if len(selected) != 2 {
+		t.Fatalf("expected all prices, got %d", len(selected))
+	}
+	if len(unmatched) != 0 {
+		t.Fatalf("expected no unmatched, got %#v", unmatched)
+	}
+	// mutating returned map must not affect input
+	selected["a"] = store.ModelPrice{Prompt: 999}
+	if prices["a"].Prompt != 1 {
+		t.Fatalf("returned map should be a copy")
+	}
+}
+
+func TestExtractProxyURLFromBodyAcceptsMultipleShapes(t *testing.T) {
+	cases := map[string]string{
+		`"http://proxy:8080"`:                  "http://proxy:8080",
+		`{"proxy-url":"http://a:1"}`:           "http://a:1",
+		`{"proxyUrl":"http://b:2"}`:            "http://b:2",
+		`{"proxy_url":"http://c:3"}`:           "http://c:3",
+		`{"value":"http://d:4"}`:               "http://d:4",
+		`{"unrelated":"x"}`:                    "",
+		`{"proxy-url":" http://e:5 "}`:         "http://e:5",
+		``:                                     "",
+	}
+	for body, want := range cases {
+		if got := extractProxyURLFromBody([]byte(body)); got != want {
+			t.Fatalf("extractProxyURLFromBody(%q) = %q, want %q", body, got, want)
+		}
+	}
+}
+
+func TestFetchCPAProxyURLUsesCacheAcrossCalls(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Path != "/v0/management/proxy-url" {
+			t.Errorf("unexpected proxy fetch path: %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer mkey" {
+			t.Errorf("missing auth header: %s", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"proxy-url":"http://cached-proxy:1080"}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	resetCPAProxyCache()
+	t.Cleanup(resetCPAProxyCache)
+
+	got, err := fetchCPAProxyURL(context.Background(), upstream.URL, "mkey")
+	if err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	if got != "http://cached-proxy:1080" {
+		t.Fatalf("first fetch value = %q", got)
+	}
+	cached, err := fetchCPAProxyURL(context.Background(), upstream.URL, "mkey")
+	if err != nil {
+		t.Fatalf("second fetch: %v", err)
+	}
+	if cached != got {
+		t.Fatalf("cached value mismatch: %q vs %q", cached, got)
+	}
+	if calls != 1 {
+		t.Fatalf("expected single upstream call, got %d", calls)
+	}
+}
+
+func TestNewHTTPClientWithProxyInjectsTransport(t *testing.T) {
+	noProxy := newHTTPClientWithProxy("", time.Second)
+	if noProxy.Transport != nil {
+		t.Fatalf("empty proxy should leave default transport")
+	}
+	invalid := newHTTPClientWithProxy("not a url", time.Second)
+	if invalid.Transport != nil {
+		t.Fatalf("invalid proxy should leave default transport")
+	}
+	valid := newHTTPClientWithProxy("http://proxy.local:1080", time.Second)
+	transport, ok := valid.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("valid proxy should set *http.Transport, got %T", valid.Transport)
+	}
+	if transport.Proxy == nil {
+		t.Fatalf("Proxy function should be set")
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://example.com", nil)
+	resolved, err := transport.Proxy(req)
+	if err != nil {
+		t.Fatalf("Proxy func error: %v", err)
+	}
+	if resolved == nil || resolved.Host != "proxy.local:1080" {
+		t.Fatalf("resolved proxy = %#v", resolved)
+	}
+}
+
+func TestModelPricesSyncReportsUnmatchedAndCaseInsensitiveMatch(t *testing.T) {
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"anthropic/claude-3.5-sonnet": {
+				"input_cost_per_token": 0.000003,
+				"output_cost_per_token": 0.000015
+			},
+			"gemini/gemini-2.5-flash": {
+				"input_cost_per_token": 0.000000075,
+				"output_cost_per_token": 0.0000003
+			}
+		}`))
+	}))
+	t.Cleanup(source.Close)
+	oldURL := modelPriceSyncURL
+	modelPriceSyncURL = source.URL
+	t.Cleanup(func() { modelPriceSyncURL = oldURL })
+	resetCPAProxyCache()
+	t.Cleanup(resetCPAProxyCache)
+
+	handler := newTestHandler(t, "http://example.test", true)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/v0/management/model-prices/sync",
+		bytes.NewBufferString(`{"models":["claude-3.5-sonnet","GEMINI/Gemini-2.5-Flash","mystery-model"]}`),
+	)
+	req.Header.Set("Authorization", "Bearer management-key")
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("sync status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var response struct {
+		Imported  int      `json:"imported"`
+		Unmatched []string `json:"unmatched"`
+		Prices    map[string]struct {
+			Prompt float64 `json:"prompt"`
+		} `json:"prices"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Imported != 2 {
+		t.Fatalf("imported = %d (body=%s)", response.Imported, rr.Body.String())
+	}
+	if len(response.Unmatched) != 1 || response.Unmatched[0] != "mystery-model" {
+		t.Fatalf("unmatched = %#v", response.Unmatched)
+	}
+	if _, ok := response.Prices["claude-3.5-sonnet"]; !ok {
+		t.Fatalf("basename-matched price not persisted: %#v", response.Prices)
+	}
+	if _, ok := response.Prices["GEMINI/Gemini-2.5-Flash"]; !ok {
+		t.Fatalf("case-insensitive match not persisted: %#v", response.Prices)
+	}
+}
+
+func resetCPAProxyCache() {
+	cpaProxyCacheMu.Lock()
+	cpaProxyCache = map[string]proxyCacheEntry{}
+	cpaProxyCacheMu.Unlock()
 }

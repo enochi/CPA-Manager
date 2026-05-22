@@ -63,6 +63,7 @@ const createEventRow = (overrides: Partial<MonitoringEventRow> = {}): Monitoring
   apiKeyLabel: overrides.apiKeyLabel ?? 'ak********sh',
   apiKeyMasked: overrides.apiKeyMasked ?? 'ak********sh',
   provider: overrides.provider ?? 'codex',
+  projectId: overrides.projectId ?? '',
   planType: overrides.planType ?? 'plus',
   channel: overrides.channel ?? 'default',
   channelHost: overrides.channelHost ?? 'localhost',
@@ -98,6 +99,21 @@ describe('accountOverviewState', () => {
       mode: 'card',
       sort: { key: 'totalCost', direction: 'asc' },
       cardPagination: { page: 3, pageSize: 18 },
+      timeRange: 'today',
+      filters: {
+        account: 'all',
+        provider: 'all',
+        model: 'all',
+        channel: 'all',
+        apiKeyHash: 'all',
+        status: 'all',
+      },
+      autoRefreshMs: '5000',
+      pageSizes: {
+        tableAccount: 12,
+        apiKey: 12,
+        realtime: 10,
+      },
     });
 
     expect(
@@ -110,6 +126,21 @@ describe('accountOverviewState', () => {
       mode: 'table',
       sort: DEFAULT_ACCOUNT_SORT,
       cardPagination: { page: 1, pageSize: 12 },
+      timeRange: 'today',
+      filters: {
+        account: 'all',
+        provider: 'all',
+        model: 'all',
+        channel: 'all',
+        apiKeyHash: 'all',
+        status: 'all',
+      },
+      autoRefreshMs: '5000',
+      pageSizes: {
+        tableAccount: 12,
+        apiKey: 12,
+        realtime: 10,
+      },
     });
   });
 
@@ -181,6 +212,7 @@ describe('accountOverviewState', () => {
       customStartInput: '',
       deferredSearch: '',
       selectedAccount: 'all',
+      selectedApiKeyHash: 'all',
       selectedChannel: 'all',
       selectedModel: 'all',
       selectedProvider: 'all',
@@ -202,6 +234,7 @@ describe('accountOverviewState', () => {
       customStartInput: '',
       deferredSearch: '',
       selectedAccount: 'all',
+      selectedApiKeyHash: 'all',
       selectedChannel: 'all',
       selectedModel: 'all',
       selectedProvider: 'all',

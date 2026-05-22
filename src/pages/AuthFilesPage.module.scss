@@ -434,6 +434,10 @@
   gap: $spacing-md;
   grid-template-columns: repeat(3, minmax(0, 1fr));
 
+  @include narrow-laptop {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   @include tablet {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -448,6 +452,10 @@
   gap: $spacing-md;
   grid-template-columns: repeat(3, minmax(0, 1fr));
 
+  @include narrow-laptop {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   @include tablet {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -461,6 +469,10 @@
   display: grid;
   gap: $spacing-md;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+
+  @include narrow-laptop {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 
   @include tablet {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1433,6 +1445,23 @@
     outline: none;
     border-color: var(--primary-color);
   }
+}
+
+.prefixProxyInvalidContentPreview {
+  width: 100%;
+  max-height: 220px;
+  margin: 0;
+  padding: $spacing-sm $spacing-md;
+  border: 1px solid var(--border-color);
+  border-radius: $radius-md;
+  background-color: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-family: monospace;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow: auto;
+  box-sizing: border-box;
 }
 
 .prefixProxyFields {

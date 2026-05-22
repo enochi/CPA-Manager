@@ -32,6 +32,7 @@ import {
   IconFileText,
   IconInfo,
   IconInbox,
+  IconKey,
   IconMoreVertical,
   IconRefreshCw,
   IconSearch,
@@ -42,10 +43,13 @@ import {
 } from '@/components/ui/icons';
 import {
   buildAccountRows,
+  buildApiKeyRows,
   buildMonitoringSummary,
   buildRealtimeMonitorRows,
   getRangeBounds,
+  type MonitoringAccountModelSpendRow,
   type MonitoringAccountRow,
+  type MonitoringApiKeyRow,
   type MonitoringCustomTimeRange,
   type MonitoringEventRow,
   type MonitoringStatusTone,
@@ -55,6 +59,7 @@ import {
 import {
   ACCOUNT_OVERVIEW_CARD_PAGE_SIZE_OPTIONS,
   ACCOUNT_OVERVIEW_TABLE_PAGE_SIZE_OPTIONS,
+  MONITORING_REALTIME_PAGE_SIZE_OPTIONS,
   buildEmptyMonitoringStatusData,
   buildMonitoringAccountAuthStateMap,
   buildMonitoringAccountStatusDataMap,
@@ -65,17 +70,19 @@ import {
   sortAccountRows,
   readAccountOverviewUiState,
   writeAccountOverviewUiState,
+  readMonitoringTransientUiState,
+  writeMonitoringTransientUiState,
+  normalizeMonitoringAutoRefreshMs,
   type AccountOverviewPageResetState,
   type AccountSortKey,
   type MonitoringAccountAuthState,
   type AccountSortState,
   type MonitoringAccountOverviewMode,
+  type MonitoringAutoRefreshValue,
+  type MonitoringStatusFilter,
 } from '@/features/monitoring/accountOverviewState';
 import { sortAccountOverviewCardMetrics } from '@/features/monitoring/accountOverviewCardMetrics';
-import {
-  buildMonitoringAccountQuotaTargetsByAccount,
-  type MonitoringAccountQuotaTarget,
-} from '@/features/monitoring/accountOverviewQuotaTargets';
+import { buildMonitoringAccountQuotaTargetsByAccount } from '@/features/monitoring/accountOverviewQuotaTargets';
 import {
   buildMonitoringStatusBlockAriaLabel,
   getNextMonitoringStatusBlockIndex,
@@ -86,12 +93,16 @@ import { useUsageData } from '@/features/monitoring/hooks/useUsageData';
 import { useHeaderRefresh } from '@/hooks/useHeaderRefresh';
 import { useInterval } from '@/hooks/useInterval';
 import { useRequestMonitoringAvailability } from '@/hooks/useRequestMonitoringAvailability';
-import { authFilesApi, requestCodexUsagePayload } from '@/services/api';
+import { authFilesApi } from '@/services/api';
 import { useAuthStore, useConfigStore, useNotificationStore } from '@/stores';
-import type { AuthFileItem, CodexUsagePayload } from '@/types';
+import type { AuthFileItem } from '@/types';
 import { formatFileSize, maskSensitiveText } from '@/utils/format';
 import type { StatusBarData, StatusBlockDetail } from '@/utils/recentRequests';
-import { buildCodexQuotaWindowInfos, normalizePlanType } from '@/utils/quota';
+import {
+  fetchAccountQuotaEntry,
+  type AccountQuotaEntry,
+  type AccountQuotaWindow,
+} from '@/features/monitoring/accountQuotaProviders';
 import {
   formatCompactNumber,
   formatDurationMs,
@@ -121,9 +132,7 @@ const AUTO_REFRESH_OPTIONS = [
   { value: '300000', labelKey: 'monitoring.auto_refresh_5m' },
 ];
 
-const REALTIME_PAGE_SIZE_OPTIONS = [10, 50, 100, 150, 300] as const;
-const DEFAULT_ACCOUNT_PAGE_SIZE = ACCOUNT_OVERVIEW_TABLE_PAGE_SIZE_OPTIONS[0];
-const DEFAULT_REALTIME_PAGE_SIZE = 10;
+const REALTIME_PAGE_SIZE_OPTIONS = MONITORING_REALTIME_PAGE_SIZE_OPTIONS;
 const MAX_USAGE_IMPORT_FILE_SIZE = 64 * 1024 * 1024;
 const EMPTY_STATUS_BAR_DATA: StatusBarData = {
   blocks: [],
@@ -152,7 +161,7 @@ const parseDateTimeLocalValue = (value: string) => {
   return Number.isFinite(timestamp) ? timestamp : null;
 };
 
-type StatusFilter = 'all' | 'success' | 'failed';
+type StatusFilter = MonitoringStatusFilter;
 
 type SummaryCardProps = {
   label: string;
@@ -183,23 +192,6 @@ type RealtimeLogRow = MonitoringEventRow & {
   successRate: number;
   streamKey: string;
   recentPattern: boolean[];
-};
-
-type AccountQuotaWindow = {
-  id: string;
-  label: string;
-  remainingPercent: number | null;
-  resetLabel: string;
-  usageLabel: string | null;
-};
-
-type AccountQuotaEntry = {
-  key: string;
-  authLabel: string;
-  fileName: string;
-  planType: string | null;
-  windows: AccountQuotaWindow[];
-  error?: string;
 };
 
 type AccountQuotaState = {
@@ -307,21 +299,6 @@ const buildRealtimeMetaText = (row: MonitoringEventRow) => {
   return maskSensitiveText(text || '-');
 };
 
-const PREMIUM_CODEX_PLAN_TYPES = new Set(['pro', 'prolite', 'pro-lite', 'pro_lite']);
-
-const getCodexPlanLabel = (planType: string | null | undefined, t: TFunction): string | null => {
-  const normalized = normalizePlanType(planType);
-  if (!normalized) return null;
-  if (normalized === 'pro') return t('codex_quota.plan_pro');
-  if (PREMIUM_CODEX_PLAN_TYPES.has(normalized) && normalized !== 'pro') {
-    return t('codex_quota.plan_prolite');
-  }
-  if (normalized === 'plus') return t('codex_quota.plan_plus');
-  if (normalized === 'team') return t('codex_quota.plan_team');
-  if (normalized === 'free') return t('codex_quota.plan_free');
-  return planType || normalized;
-};
-
 const buildAccountSecondaryText = (row: MonitoringAccountRow) => {
   const primaryText = row.displayAccount || row.account;
   if (row.account && row.account !== primaryText) {
@@ -403,57 +380,81 @@ const buildAccountSummaryMetrics = (
   },
 ];
 
-const buildAccountQuotaWindows = (payload: CodexUsagePayload, t: TFunction): AccountQuotaWindow[] =>
-  buildCodexQuotaWindowInfos(payload).map((window) => {
-    const clampedUsed =
-      window.usedPercent === null ? null : Math.max(0, Math.min(100, window.usedPercent));
-    const remainingPercent = clampedUsed === null ? null : Math.max(0, 100 - clampedUsed);
-    let usageLabel: string | null = null;
-
-    if (
-      window.limitWindowSeconds !== null &&
-      window.limitWindowSeconds > 0 &&
-      clampedUsed !== null
-    ) {
-      const totalHours = window.limitWindowSeconds / 3600;
-      const usedHours = (totalHours * clampedUsed) / 100;
-      const formatHours = (value: number) =>
-        Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1);
-      usageLabel = t('codex_quota.window_usage', {
-        used: formatHours(usedHours),
-        total: formatHours(totalHours),
-      });
+const buildApiKeySecondaryText = (row: MonitoringApiKeyRow) => {
+  if (row.isUnknown) {
+    if (row.authLabels.length > 0) {
+      return joinShort(row.authLabels, 2);
     }
-
-    return {
-      id: window.id,
-      label: t(window.labelKey, window.labelParams),
-      remainingPercent,
-      resetLabel: window.resetLabel,
-      usageLabel,
-    };
-  });
-
-const requestAccountQuota = async (
-  target: MonitoringAccountQuotaTarget,
-  t: TFunction
-): Promise<AccountQuotaEntry> => {
-  const payload = await requestCodexUsagePayload(
-    {
-      authIndex: target.authIndex,
-      accountId: target.accountId,
-    },
-    { emptyMessage: t('codex_quota.empty_windows') }
-  );
-
-  return {
-    key: target.key,
-    authLabel: target.authLabel,
-    fileName: target.fileName,
-    planType: normalizePlanType(payload.plan_type ?? payload.planType) ?? target.planType,
-    windows: buildAccountQuotaWindows(payload, t),
-  };
+    if (row.sourceLabels.length > 0) {
+      return joinShort(row.sourceLabels, 2);
+    }
+    if (row.channels.length > 0) {
+      return joinShort(row.channels, 2);
+    }
+  }
+  if (row.apiKeyLabel && row.apiKeyMasked && row.apiKeyLabel !== row.apiKeyMasked) {
+    return row.apiKeyMasked;
+  }
+  if (row.apiKeyHash) {
+    return `sha256:${row.apiKeyHash.slice(0, 12)}`;
+  }
+  return '';
 };
+
+const buildApiKeySummaryMetrics = (
+  row: MonitoringApiKeyRow,
+  hasPrices: boolean,
+  locale: string,
+  t: TFunction
+): AccountSummaryMetric[] => [
+  {
+    key: 'total-calls',
+    label: t('monitoring.total_calls'),
+    value: formatCompactNumber(row.totalCalls),
+  },
+  {
+    key: 'success-calls',
+    label: t('monitoring.success_calls'),
+    value: formatCompactNumber(row.successCalls),
+    valueClassName: styles.goodText,
+  },
+  {
+    key: 'failure-calls',
+    label: t('monitoring.failure_calls'),
+    value: formatCompactNumber(row.failureCalls),
+    valueClassName: row.failureCalls > 0 ? styles.badText : undefined,
+  },
+  {
+    key: 'total-tokens',
+    label: t('monitoring.total_tokens'),
+    value: formatCompactNumber(row.totalTokens),
+  },
+  {
+    key: 'input-tokens',
+    label: t('monitoring.input_tokens'),
+    value: formatCompactNumber(row.inputTokens),
+  },
+  {
+    key: 'output-tokens',
+    label: t('monitoring.output_tokens'),
+    value: formatCompactNumber(row.outputTokens),
+  },
+  {
+    key: 'cached-tokens',
+    label: t('monitoring.cached_tokens'),
+    value: formatCompactNumber(row.cachedTokens),
+  },
+  {
+    key: 'estimated-cost',
+    label: t('monitoring.estimated_cost'),
+    value: hasPrices ? formatUsd(row.totalCost) : '--',
+  },
+  {
+    key: 'latest-request-time',
+    label: t('monitoring.latest_request_time'),
+    value: new Date(row.lastSeenAt).toLocaleString(locale),
+  },
+];
 
 const buildRealtimeLogRows = (rows: MonitoringEventRow[]): RealtimeLogRow[] => {
   const sortedAsc = [...rows].sort(
@@ -1034,9 +1035,9 @@ function AccountQuotaPanel({
       ? new Date(quotaState.lastRefreshedAt).toLocaleString(locale)
       : '';
   const singleQuotaEntry = quotaEntries.length === 1 ? quotaEntries[0] : null;
-  const singlePlanLabel = singleQuotaEntry ? getCodexPlanLabel(singleQuotaEntry.planType, t) : null;
+  const singleSubtitle = singleQuotaEntry?.subtitle ?? null;
   const quotaMetaText = [
-    singlePlanLabel ? `${t('codex_quota.plan_label')}: ${singlePlanLabel}` : '',
+    singleSubtitle,
     lastQuotaSync ? `${t('monitoring.last_sync')}: ${lastQuotaSync}` : '',
   ]
     .filter(Boolean)
@@ -1082,7 +1083,7 @@ function AccountQuotaPanel({
         size={14}
         className={quotaLoading ? styles.refreshIconSpinning : styles.refreshIcon}
       />
-      <span>{t('codex_quota.refresh_button')}</span>
+      <span>{t('monitoring.account_quota_refresh')}</span>
     </button>
   );
 
@@ -1101,7 +1102,7 @@ function AccountQuotaPanel({
             size={14}
             className={quotaLoading ? styles.refreshIconSpinning : styles.refreshIcon}
           />
-          <span>{t('codex_quota.retry_button')}</span>
+          <span>{t('monitoring.account_quota_retry')}</span>
         </button>
       ) : null}
     </div>
@@ -1111,19 +1112,19 @@ function AccountQuotaPanel({
     <section className={styles.quotaSection}>
       <div className={styles.quotaSectionHeader}>
         <div className={styles.quotaSectionTitleGroup}>
-          <strong>{t('codex_quota.title')}</strong>
+          <strong>{t('monitoring.account_quota_title')}</strong>
           {quotaMetaText ? <span>{quotaMetaText}</span> : null}
         </div>
         {renderRefreshButton()}
       </div>
 
       {quotaLoading && quotaEntries.length === 0
-        ? renderStateMessage(t('codex_quota.loading'))
+        ? renderStateMessage(t('monitoring.account_quota_loading'))
         : null}
 
       {!quotaLoading && quotaState?.status === 'error' && quotaEntries.length === 0
         ? renderStateMessage(
-            t('codex_quota.load_failed', {
+            t('monitoring.account_quota_load_failed', {
               message: quotaState.error || t('common.unknown_error'),
             }),
             undefined,
@@ -1132,52 +1133,59 @@ function AccountQuotaPanel({
         : null}
 
       {!quotaLoading && quotaState?.status === 'success' && quotaEntries.length === 0
-        ? renderStateMessage(t('codex_quota.empty_windows'), t('codex_quota.idle'))
+        ? renderStateMessage(
+            t('monitoring.account_quota_empty'),
+            t('monitoring.account_quota_idle')
+          )
         : null}
 
       {!quotaState && quotaEntries.length === 0
-        ? renderStateMessage(t('codex_quota.empty_windows'), t('codex_quota.idle'))
+        ? renderStateMessage(
+            t('monitoring.account_quota_empty'),
+            t('monitoring.account_quota_idle')
+          )
         : null}
 
       {singleQuotaEntry ? (
         singleQuotaEntry.error ? (
           renderStateMessage(
-            t('codex_quota.load_failed', { message: singleQuotaEntry.error }),
+            t('monitoring.account_quota_load_failed', { message: singleQuotaEntry.error }),
             undefined,
             true
           )
         ) : singleQuotaEntry.windows.length > 0 ? (
           renderQuotaWindows(singleQuotaEntry.windows)
         ) : (
-          renderStateMessage(t('codex_quota.empty_windows'), t('codex_quota.idle'))
+          renderStateMessage(
+            t('monitoring.account_quota_empty'),
+            t('monitoring.account_quota_idle')
+          )
         )
       ) : quotaEntries.length > 0 ? (
         <div className={styles.quotaEntryGrid}>
-          {quotaEntries.map((entry) => {
-            const planLabel = getCodexPlanLabel(entry.planType, t);
-            return (
-              <div key={entry.key} className={styles.quotaEntryCard}>
-                <div className={styles.quotaEntryHeader}>
-                  <div className={styles.quotaEntryMain}>
-                    <strong>{entry.authLabel}</strong>
-                    <small>
-                      {planLabel ? `${t('codex_quota.plan_label')}: ${planLabel}` : entry.fileName}
-                    </small>
-                  </div>
+          {quotaEntries.map((entry) => (
+            <div key={entry.key} className={styles.quotaEntryCard}>
+              <div className={styles.quotaEntryHeader}>
+                <div className={styles.quotaEntryMain}>
+                  <strong>{entry.authLabel}</strong>
+                  <small>{entry.subtitle ?? entry.fileName}</small>
                 </div>
-
-                {entry.error
-                  ? renderStateMessage(
-                      t('codex_quota.load_failed', { message: entry.error }),
-                      undefined,
-                      true
-                    )
-                  : entry.windows.length > 0
-                    ? renderQuotaWindows(entry.windows)
-                    : renderStateMessage(t('codex_quota.empty_windows'), t('codex_quota.idle'))}
               </div>
-            );
-          })}
+
+              {entry.error
+                ? renderStateMessage(
+                    t('monitoring.account_quota_load_failed', { message: entry.error }),
+                    undefined,
+                    true
+                  )
+                : entry.windows.length > 0
+                  ? renderQuotaWindows(entry.windows)
+                  : renderStateMessage(
+                      t('monitoring.account_quota_empty'),
+                      t('monitoring.account_quota_idle')
+                    )}
+            </div>
+          ))}
         </div>
       ) : null}
     </section>
@@ -1362,7 +1370,7 @@ function AccountModelUsageList({
   t,
   limit = 2,
 }: {
-  row: MonitoringAccountRow;
+  row: { id: string; models: MonitoringAccountModelSpendRow[] };
   hasPrices: boolean;
   locale: string;
   t: TFunction;
@@ -1478,7 +1486,7 @@ function AccountModelUsageTable({
   t,
   limit = 2,
 }: {
-  row: MonitoringAccountRow;
+  row: { id: string; models: MonitoringAccountModelSpendRow[] };
   hasPrices: boolean;
   locale: string;
   t: TFunction;
@@ -1549,6 +1557,69 @@ function AccountModelUsageTable({
         <div className={styles.emptyBlockSmall}>{t('monitoring.account_overview_no_models')}</div>
       )}
     </section>
+  );
+}
+
+function ApiKeySummaryPrimary({
+  row,
+  expanded,
+  onToggle,
+  t,
+}: {
+  row: MonitoringApiKeyRow;
+  expanded: boolean;
+  onToggle: () => void;
+  t: TFunction;
+}) {
+  const secondaryText = buildApiKeySecondaryText(row);
+  const keyLabel = row.isUnknown
+    ? t('monitoring.api_key_unknown_label')
+    : row.apiKeyLabel || row.apiKeyMasked || t('monitoring.api_key_unknown_label');
+
+  return (
+    <button
+      type="button"
+      className={[styles.accountButton, expanded ? styles.expandedAccountButton : '']
+        .filter(Boolean)
+        .join(' ')}
+      onClick={onToggle}
+      aria-expanded={expanded}
+      title={keyLabel}
+    >
+      <span className={styles.accountExpandGlyph} aria-hidden="true">
+        {expanded ? <IconChevronUp size={15} /> : <IconChevronDown size={15} />}
+      </span>
+      <span className={styles.accountIdentityLine}>
+        <span className={styles.apiKeyIcon} aria-hidden="true">
+          <IconKey size={13} />
+        </span>
+        <span className={styles.accountButtonLabel}>{keyLabel}</span>
+      </span>
+      {secondaryText ? <small>{secondaryText}</small> : null}
+    </button>
+  );
+}
+
+function ApiKeyExpandedDetails({
+  row,
+  hasPrices,
+  locale,
+  t,
+}: {
+  row: MonitoringApiKeyRow;
+  hasPrices: boolean;
+  locale: string;
+  t: TFunction;
+}) {
+  const summaryMetrics = buildApiKeySummaryMetrics(row, hasPrices, locale, t);
+
+  return (
+    <div className={styles.apiKeyExpandedDetails}>
+      <div className={styles.accountStructureModelPanel}>
+        <AccountTokenMetricGrid metrics={summaryMetrics} t={t} variant="table" />
+        <AccountModelUsageTable row={row} hasPrices={hasPrices} locale={locale} t={t} />
+      </div>
+    </div>
   );
 }
 
@@ -1754,20 +1825,45 @@ export function MonitoringCenterPage() {
   const showNotification = useNotificationStore((state) => state.showNotification);
   const showConfirmation = useNotificationStore((state) => state.showConfirmation);
   const requestMonitoringAvailability = useRequestMonitoringAvailability();
-  const [timeRange, setTimeRange] = useState<MonitoringTimeRange>('today');
-  const [customStartInput, setCustomStartInput] = useState(getTodayStartInputValue);
-  const [customEndInput, setCustomEndInput] = useState(getCurrentInputValue);
+  const initialAccountOverviewUiState = useRef(readAccountOverviewUiState());
+  const initialMonitoringTransientState = useRef(readMonitoringTransientUiState());
+  const [timeRange, setTimeRange] = useState<MonitoringTimeRange>(
+    initialAccountOverviewUiState.current.timeRange
+  );
+  const [customStartInput, setCustomStartInput] = useState(
+    () => initialMonitoringTransientState.current.customStartInput || getTodayStartInputValue()
+  );
+  const [customEndInput, setCustomEndInput] = useState(
+    () => initialMonitoringTransientState.current.customEndInput || getCurrentInputValue()
+  );
   const [customDraftStartInput, setCustomDraftStartInput] = useState(getTodayStartInputValue);
   const [customDraftEndInput, setCustomDraftEndInput] = useState(getCurrentInputValue);
-  const [searchInput, setSearchInput] = useState('');
-  const [autoRefreshMs, setAutoRefreshMs] = useState('5000');
-  const [selectedAccount, setSelectedAccount] = useState('all');
-  const [selectedProvider, setSelectedProvider] = useState('all');
-  const [selectedModel, setSelectedModel] = useState('all');
-  const [selectedChannel, setSelectedChannel] = useState('all');
-  const [selectedApiKeyHash, setSelectedApiKeyHash] = useState('all');
-  const [selectedStatus, setSelectedStatus] = useState<StatusFilter>('all');
+  const [searchInput, setSearchInput] = useState(
+    initialMonitoringTransientState.current.searchInput
+  );
+  const [autoRefreshMs, setAutoRefreshMs] = useState<MonitoringAutoRefreshValue>(
+    initialAccountOverviewUiState.current.autoRefreshMs
+  );
+  const [selectedAccount, setSelectedAccount] = useState(
+    initialAccountOverviewUiState.current.filters.account
+  );
+  const [selectedProvider, setSelectedProvider] = useState(
+    initialAccountOverviewUiState.current.filters.provider
+  );
+  const [selectedModel, setSelectedModel] = useState(
+    initialAccountOverviewUiState.current.filters.model
+  );
+  const [selectedChannel, setSelectedChannel] = useState(
+    initialAccountOverviewUiState.current.filters.channel
+  );
+  const [selectedApiKeyHash, setSelectedApiKeyHash] = useState(
+    initialAccountOverviewUiState.current.filters.apiKeyHash
+  );
+  const [selectedStatus, setSelectedStatus] = useState<StatusFilter>(
+    initialAccountOverviewUiState.current.filters.status
+  );
   const [expandedAccounts, setExpandedAccounts] = useState<Record<string, boolean>>({});
+  const [expandedApiKeys, setExpandedApiKeys] = useState<Record<string, boolean>>({});
   const [focusedAccount, setFocusedAccount] = useState<string | null>(null);
   const [isPriceModalOpen, setIsPriceModalOpen] = useState(false);
   const [isCustomRangeModalOpen, setIsCustomRangeModalOpen] = useState(false);
@@ -1779,7 +1875,6 @@ export function MonitoringCenterPage() {
   const [accountQuotaStates, setAccountQuotaStates] = useState<Record<string, AccountQuotaState>>(
     {}
   );
-  const initialAccountOverviewUiState = useRef(readAccountOverviewUiState());
   const [accountOverviewMode, setAccountOverviewMode] = useState<MonitoringAccountOverviewMode>(
     initialAccountOverviewUiState.current.mode
   );
@@ -1791,12 +1886,18 @@ export function MonitoringCenterPage() {
     card: initialAccountOverviewUiState.current.cardPagination.page,
   }));
   const [accountPageSizeByMode, setAccountPageSizeByMode] = useState(() => ({
-    table: DEFAULT_ACCOUNT_PAGE_SIZE,
+    table: initialAccountOverviewUiState.current.pageSizes.tableAccount,
     card: initialAccountOverviewUiState.current.cardPagination.pageSize,
   }));
   const [accountStatusUpdating, setAccountStatusUpdating] = useState<Record<string, boolean>>({});
+  const [apiKeyPage, setApiKeyPage] = useState(1);
+  const [apiKeyPageSize, setApiKeyPageSize] = useState<number>(
+    initialAccountOverviewUiState.current.pageSizes.apiKey
+  );
   const [realtimePage, setRealtimePage] = useState(1);
-  const [realtimePageSize, setRealtimePageSize] = useState(DEFAULT_REALTIME_PAGE_SIZE);
+  const [realtimePageSize, setRealtimePageSize] = useState(
+    initialAccountOverviewUiState.current.pageSizes.realtime
+  );
   const focusSnapshotRef = useRef<FocusSnapshot | null>(null);
   const previousAccountPageResetStateRef = useRef<AccountOverviewPageResetState | null>(null);
   const accountQuotaStatesRef = useRef<Record<string, AccountQuotaState>>({});
@@ -1945,8 +2046,47 @@ export function MonitoringCenterPage() {
         page: accountPageByMode.card,
         pageSize: accountPageSizeByMode.card,
       },
+      timeRange,
+      filters: {
+        account: selectedAccount,
+        provider: selectedProvider,
+        model: selectedModel,
+        channel: selectedChannel,
+        apiKeyHash: selectedApiKeyHash,
+        status: selectedStatus,
+      },
+      autoRefreshMs,
+      pageSizes: {
+        tableAccount: accountPageSizeByMode.table,
+        apiKey: apiKeyPageSize,
+        realtime: realtimePageSize,
+      },
     });
-  }, [accountOverviewMode, accountPageByMode.card, accountPageSizeByMode.card, accountSort]);
+  }, [
+    accountOverviewMode,
+    accountPageByMode.card,
+    accountPageSizeByMode.card,
+    accountPageSizeByMode.table,
+    accountSort,
+    apiKeyPageSize,
+    autoRefreshMs,
+    realtimePageSize,
+    selectedAccount,
+    selectedApiKeyHash,
+    selectedChannel,
+    selectedModel,
+    selectedProvider,
+    selectedStatus,
+    timeRange,
+  ]);
+
+  useEffect(() => {
+    writeMonitoringTransientUiState({
+      searchInput,
+      customStartInput,
+      customEndInput,
+    });
+  }, [customEndInput, customStartInput, searchInput]);
 
   const providerOptions = useMemo(
     () => [
@@ -2099,6 +2239,7 @@ export function MonitoringCenterPage() {
 
   const scopedSummary = useMemo(() => buildMonitoringSummary(scopedStatsRows), [scopedStatsRows]);
   const accountRows = useMemo(() => buildAccountRows(scopedRows), [scopedRows]);
+  const apiKeyRows = useMemo(() => buildApiKeyRows(scopedRows), [scopedRows]);
   const accountStatusDataByRowId = useMemo(
     () => buildMonitoringAccountStatusDataMap(scopedRows, accountStatusBounds),
     [accountStatusBounds, scopedRows]
@@ -2124,6 +2265,10 @@ export function MonitoringCenterPage() {
     () => buildPaginationState(sortedAccountRows, accountPage, accountPageSize),
     [accountPage, accountPageSize, sortedAccountRows]
   );
+  const apiKeyPagination = useMemo(
+    () => buildPaginationState(apiKeyRows, apiKeyPage, apiKeyPageSize),
+    [apiKeyPage, apiKeyPageSize, apiKeyRows]
+  );
   const realtimePagination = useMemo(
     () => buildPaginationState(realtimeLogRows, realtimePage, realtimePageSize),
     [realtimeLogRows, realtimePage, realtimePageSize]
@@ -2134,6 +2279,7 @@ export function MonitoringCenterPage() {
       customStartInput,
       deferredSearch,
       selectedAccount,
+      selectedApiKeyHash,
       selectedChannel,
       selectedModel,
       selectedProvider,
@@ -2145,6 +2291,7 @@ export function MonitoringCenterPage() {
       customStartInput,
       deferredSearch,
       selectedAccount,
+      selectedApiKeyHash,
       selectedChannel,
       selectedModel,
       selectedProvider,
@@ -2161,6 +2308,7 @@ export function MonitoringCenterPage() {
       )
     ) {
       resetCurrentAccountPage();
+      setApiKeyPage(1);
       setRealtimePage(1);
     }
 
@@ -2181,6 +2329,17 @@ export function MonitoringCenterPage() {
     () => buildMonitoringAccountQuotaTargetsByAccount(accountRows, accountAuthStateByRowId),
     [accountAuthStateByRowId, accountRows]
   );
+  const accountAuthFilesByAccount = useMemo(() => {
+    const map = new Map<string, Map<string, AuthFileItem>>();
+    accountRows.forEach((row) => {
+      const authState = accountAuthStateByRowId.get(row.id);
+      if (!authState) return;
+      const filesByName = new Map<string, AuthFileItem>();
+      authState.files.forEach((file) => filesByName.set(file.name, file));
+      map.set(row.account, filesByName);
+    });
+    return map;
+  }, [accountRows, accountAuthStateByRowId]);
   const scopedFailureCount = scopedRows.filter((row) => row.failed).length;
   const savedPriceEntries = useMemo(
     () => Object.entries(modelPrices).sort((left, right) => left[0].localeCompare(right[0])),
@@ -2237,6 +2396,19 @@ export function MonitoringCenterPage() {
         sortKey: 'lastSeenAt',
       },
       { key: 'action', label: t('common.action') },
+    ],
+    [t]
+  );
+
+  const apiKeyOverviewColumns = useMemo<AccountOverviewColumn[]>(
+    () => [
+      { key: 'api-key', label: t('monitoring.api_key_summary_col_key') },
+      { key: 'total-calls', label: t('monitoring.total_calls') },
+      { key: 'success-calls', label: t('monitoring.account_overview_col_success') },
+      { key: 'failure-calls', label: t('monitoring.account_overview_col_failure') },
+      { key: 'total-tokens', label: t('monitoring.total_tokens') },
+      { key: 'estimated-cost', label: t('monitoring.account_overview_col_cost') },
+      { key: 'latest-request-time', label: t('monitoring.latest_request_time') },
     ],
     [t]
   );
@@ -2396,6 +2568,13 @@ export function MonitoringCenterPage() {
     setSelectedStatus((previous) => (previous === 'failed' ? 'all' : 'failed'));
   }, []);
 
+  const toggleApiKeyExpanded = useCallback((apiKeyId: string) => {
+    setExpandedApiKeys((previous) => ({
+      ...previous,
+      [apiKeyId]: !previous[apiKeyId],
+    }));
+  }, []);
+
   const loadAccountQuota = useCallback(
     async (account: string, force: boolean = false) => {
       const currentState = accountQuotaStatesRef.current[account];
@@ -2438,30 +2617,11 @@ export function MonitoringCenterPage() {
         return;
       }
 
-      const settled = await Promise.allSettled(
-        targets.map((target) => requestAccountQuota(target, t))
+      const filesByName = accountAuthFilesByAccount.get(account) ?? new Map<string, AuthFileItem>();
+      const entries = await Promise.all(
+        targets.map((target) => fetchAccountQuotaEntry(target, filesByName.get(target.fileName), t))
       );
       if (accountQuotaRequestIdsRef.current[account] !== requestId) return;
-
-      const entries = settled.map((result, index) => {
-        const fallback = targets[index];
-        if (result.status === 'fulfilled') {
-          return result.value;
-        }
-
-        const error =
-          result.reason instanceof Error
-            ? result.reason.message
-            : String(result.reason || t('common.unknown_error'));
-        return {
-          key: fallback.key,
-          authLabel: fallback.authLabel,
-          fileName: fallback.fileName,
-          planType: fallback.planType,
-          windows: [],
-          error,
-        } satisfies AccountQuotaEntry;
-      });
 
       const hasSuccess = entries.some((entry) => !entry.error);
       setAccountQuotaStates((previous) => ({
@@ -2475,7 +2635,7 @@ export function MonitoringCenterPage() {
         },
       }));
     },
-    [accountQuotaTargetsByAccount, t]
+    [accountAuthFilesByAccount, accountQuotaTargetsByAccount, t]
   );
 
   const toggleAccountExpanded = useCallback(
@@ -2548,6 +2708,11 @@ export function MonitoringCenterPage() {
     },
     [accountOverviewMode, resetCurrentAccountPage]
   );
+
+  const handleApiKeyPageSizeChange = useCallback((pageSize: number) => {
+    setApiKeyPageSize(normalizeAccountOverviewPageSize(pageSize, 'table'));
+    setApiKeyPage(1);
+  }, []);
 
   const handleAccountStatusToggle = useCallback(
     async (row: MonitoringAccountRow, enabled: boolean) => {
@@ -2640,6 +2805,10 @@ export function MonitoringCenterPage() {
     [setCurrentAccountPage]
   );
 
+  const handleApiKeyPageChange = useCallback((page: number) => {
+    setApiKeyPage(page);
+  }, []);
+
   const handlePriceModelChange = useCallback(
     (value: string) => {
       setPriceModel(value);
@@ -2707,13 +2876,21 @@ export function MonitoringCenterPage() {
     setSyncingPrices(true);
     try {
       const result = await syncModelPrices(syncPriceModels);
-      showNotification(
-        t('usage_stats.model_price_sync_success', {
-          count: result.imported,
-          source: result.source || 'LiteLLM',
-        }),
-        'success'
-      );
+      const unmatchedCount = result.unmatched?.length ?? 0;
+      const baseMessage = t('usage_stats.model_price_sync_success', {
+        count: result.imported,
+        source: result.source || 'LiteLLM',
+      });
+      if (unmatchedCount > 0) {
+        showNotification(
+          `${baseMessage}${t('usage_stats.model_price_sync_unmatched_suffix', {
+            count: unmatchedCount,
+          })}`,
+          'warning'
+        );
+      } else {
+        showNotification(baseMessage, 'success');
+      }
     } catch (error: unknown) {
       const rawMessage =
         error instanceof Error ? error.message : String(error || t('common.unknown_error'));
@@ -2974,7 +3151,7 @@ export function MonitoringCenterPage() {
                   value: option.value,
                   label: t(option.labelKey),
                 }))}
-                onChange={setAutoRefreshMs}
+                onChange={(value) => setAutoRefreshMs(normalizeMonitoringAutoRefreshMs(value))}
                 ariaLabel={t('monitoring.auto_refresh')}
                 fullWidth={false}
               />
@@ -3387,6 +3564,112 @@ export function MonitoringCenterPage() {
       </MonitoringPanel>
 
       <MonitoringPanel
+        title={
+          <span className={styles.panelTitleWithHint}>
+            {t('monitoring.api_key_summary_title')}
+            <span title={t('monitoring.api_key_summary_description')}>
+              <IconInfo
+                size={14}
+                className={styles.panelTitleHintIcon}
+                aria-label={t('monitoring.api_key_summary_description')}
+              />
+            </span>
+          </span>
+        }
+        subtitle={t('monitoring.api_key_summary_desc')}
+        className={styles.apiKeyPanel}
+        extra={
+          <div className={styles.inlineMetrics}>
+            <span>{t('monitoring.api_key_summary_keys_count', { count: apiKeyRows.length })}</span>
+          </div>
+        }
+      >
+        <div className={`${styles.tableWrapper} ${styles.apiKeySummaryTableWrapper}`}>
+          <table className={`${styles.table} ${styles.apiKeySummaryTable}`}>
+            <colgroup>
+              {apiKeyOverviewColumns.map((column) => (
+                <col key={column.key} />
+              ))}
+            </colgroup>
+            <thead>
+              <tr>
+                {apiKeyOverviewColumns.map((column) => (
+                  <th key={column.key}>{column.label}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {apiKeyPagination.pageItems.map((row) => {
+                const isExpanded = Boolean(expandedApiKeys[row.id]);
+                const keyMetrics = buildApiKeySummaryMetrics(row, hasPrices, i18n.language, t);
+                const keyMetricByKey = new Map(keyMetrics.map((metric) => [metric.key, metric]));
+                const rowClassName = [
+                  styles.apiKeySummaryRow,
+                  isExpanded ? styles.apiKeySummaryRowExpanded : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ');
+
+                return (
+                  <Fragment key={row.id}>
+                    <tr className={rowClassName}>
+                      <td>
+                        <ApiKeySummaryPrimary
+                          row={row}
+                          expanded={isExpanded}
+                          onToggle={() => toggleApiKeyExpanded(row.id)}
+                          t={t}
+                        />
+                      </td>
+                      <td>{keyMetricByKey.get('total-calls')?.value ?? '--'}</td>
+                      <td className={keyMetricByKey.get('success-calls')?.valueClassName}>
+                        {keyMetricByKey.get('success-calls')?.value ?? '--'}
+                      </td>
+                      <td className={keyMetricByKey.get('failure-calls')?.valueClassName}>
+                        {keyMetricByKey.get('failure-calls')?.value ?? '--'}
+                      </td>
+                      <td>{keyMetricByKey.get('total-tokens')?.value ?? '--'}</td>
+                      <td>{keyMetricByKey.get('estimated-cost')?.value ?? '--'}</td>
+                      <td>{keyMetricByKey.get('latest-request-time')?.value ?? '--'}</td>
+                    </tr>
+                    {isExpanded ? (
+                      <tr className={styles.apiKeyDetailRow}>
+                        <td colSpan={apiKeyOverviewColumns.length}>
+                          <ApiKeyExpandedDetails
+                            row={row}
+                            hasPrices={hasPrices}
+                            locale={i18n.language}
+                            t={t}
+                          />
+                        </td>
+                      </tr>
+                    ) : null}
+                  </Fragment>
+                );
+              })}
+              {apiKeyRows.length === 0 ? (
+                <tr>
+                  <td colSpan={apiKeyOverviewColumns.length}>{renderMonitoringEmptyState()}</td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+        <PaginationControls
+          count={apiKeyRows.length}
+          currentPage={apiKeyPagination.currentPage}
+          totalPages={apiKeyPagination.totalPages}
+          startItem={apiKeyPagination.startItem}
+          endItem={apiKeyPagination.endItem}
+          pageSize={apiKeyPageSize}
+          pageSizeOptions={ACCOUNT_OVERVIEW_TABLE_PAGE_SIZE_OPTIONS}
+          onPageChange={handleApiKeyPageChange}
+          onPageSizeChange={handleApiKeyPageSizeChange}
+          t={t}
+        />
+      </MonitoringPanel>
+
+      <MonitoringPanel
         title={t('monitoring.realtime_table_title')}
         subtitle={t('monitoring.realtime_table_desc')}
         className={styles.realtimePanel}
@@ -3450,6 +3733,11 @@ export function MonitoringCenterPage() {
                     <td>
                       <div className={styles.primaryCell}>
                         <span className={styles.monoCell}>{row.model}</span>
+                        {row.resolvedModel && row.resolvedModel !== row.model ? (
+                          <small className={styles.monoCell}>
+                            ↳ {t('monitoring.resolved_model_label', { model: row.resolvedModel })}
+                          </small>
+                        ) : null}
                         <small className={styles.monoCell}>{buildRealtimeMetaText(row)}</small>
                       </div>
                     </td>
